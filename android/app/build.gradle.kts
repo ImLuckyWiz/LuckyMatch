@@ -6,7 +6,6 @@ plugins {
 android {
     namespace = "com.luckymatch.app"
     compileSdk = 35
-    ndkVersion = "30.0.16248370"
 
     defaultConfig {
         applicationId = "com.luckymatch.app"

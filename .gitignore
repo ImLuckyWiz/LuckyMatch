@@ -10,6 +10,8 @@ lyrics_custom/
 Thumbs.db
 .idea/
 dist/
+__pycache__/
+*.pyc
 android/local.properties
 android/.gradle/
 android/app/build/
