@@ -102,16 +102,22 @@ jobs:
           RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384" cargo ndk -t arm64-v8a -t x86_64 -o android/app/src/main/jniLibs build -p luckymatch-ffi --release
           cargo run -p luckymatch-ffi --features bindgen-cli --bin uniffi-bindgen -- generate --library android/app/src/main/jniLibs/arm64-v8a/libluckymatch_ffi.so --language kotlin --out-dir android/app/src/main/java
 
-      - name: Build Android APK
+      - name: Build signed Android Release APK
         working-directory: android
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/luckymatch-release.jks
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$ANDROID_KEYSTORE_PATH"
           chmod +x gradlew
-          ./gradlew :app:assembleDebug --no-daemon
+          ./gradlew :app:assembleRelease --no-daemon
 
       - name: Stage APK artifact
         run: |
           mkdir -p dist
-          cp android/app/build/outputs/apk/debug/app-debug.apk dist/luckymatch-android.apk
+          cp android/app/build/outputs/apk/release/app-release.apk dist/luckymatch-android.apk
 
       - name: Upload Android artifact
         uses: actions/upload-artifact@v4
