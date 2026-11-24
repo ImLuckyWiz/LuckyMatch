@@ -132,21 +132,38 @@ pub fn spawn_backend() -> BackendHandle {
 
 fn load_desktop_config() -> LuckyMatchConfig {
     let cwd_cfg = PathBuf::from("config.json");
+    let exe_cfg = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("config.json")))
+        .filter(|p| p.exists());
+    let appdata_dir = std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("LuckyMatch"));
+    let appdata_cfg = appdata_dir
+        .as_ref()
+        .map(|d| d.join("config.json"))
+        .filter(|p| p.exists());
+
     let config_path = if cwd_cfg.exists() {
         Some(cwd_cfg)
     } else {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|dir| dir.join("config.json")))
-            .filter(|p| p.exists())
+        exe_cfg.or(appdata_cfg)
     };
+
+    let local_data_dir = std::env::var_os("LOCALAPPDATA")
+        .map(|d| PathBuf::from(d).join("LuckyMatch"))
+        .filter(|_| !PathBuf::from("Cargo.toml").exists());
 
     let mut cfg = LuckyMatchConfig::load(config_path.as_deref());
     if cfg.cache_dir.is_none() {
-        cfg.cache_dir = Some(PathBuf::from("cache").join("lyrics"));
+        cfg.cache_dir = Some(match &local_data_dir {
+            Some(base) => base.join("cache").join("lyrics"),
+            None => PathBuf::from("cache").join("lyrics"),
+        });
     }
     if cfg.custom_lyrics_dir.is_none() {
-        cfg.custom_lyrics_dir = Some(PathBuf::from("lyrics_custom"));
+        cfg.custom_lyrics_dir = Some(match &local_data_dir {
+            Some(base) => base.join("lyrics_custom"),
+            None => PathBuf::from("lyrics_custom"),
+        });
     }
     cfg
 }
