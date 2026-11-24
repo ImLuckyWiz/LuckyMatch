@@ -1,0 +1,19 @@
+[package]
+name = "luckymatch-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI recognition & live terminal karaoke client for LuckyMatch"
+
+[dependencies]
+luckymatch-core = { path = "../luckymatch-core" }
+clap = { version = "4", features = ["derive"] }
+tokio.workspace = true
+hound = "3.5"
+crossterm = "0.29"
+anyhow = "1"
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.27"

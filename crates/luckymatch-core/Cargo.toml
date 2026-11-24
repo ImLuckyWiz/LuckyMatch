@@ -1,0 +1,29 @@
+[package]
+name = "luckymatch-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Portable song recognition, metadata resolution, lyrics waterfall, and playback sync engine for LuckyMatch"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Pure-Rust TLS (rustls + ring + webpki-roots) so Android cross-compiles never need OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "http2", "charset", "rustls-tls-webpki-roots"] }
+
+# Shazam audio fingerprinting (shazamio-core, MIT)
+chfft = "0.3.4"
+byteorder = "1.5"
+crc32fast = "1.4"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+
+# Lyrics parsing & URL resolution
+roxmltree = "0.21"
+url = "2.5"
+urlencoding = "2.1"
+regex = "1.11"

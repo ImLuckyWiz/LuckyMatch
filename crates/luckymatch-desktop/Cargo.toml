@@ -1,0 +1,24 @@
+[package]
+name = "luckymatch-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native GPUI desktop & floating overlay lyrics app for LuckyMatch"
+
+[dependencies]
+luckymatch-core = { path = "../luckymatch-core" }
+gpui = "0.2.2"
+tokio.workspace = true
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+smallvec = "1"
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.27"
+raw-window-handle = "0.6"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

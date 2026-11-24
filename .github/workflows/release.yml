@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    name: Build Windows Desktop & CLI
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release -p luckymatch-desktop -p luckymatch-cli
+
+      - name: Package Windows zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist\luckymatch-windows-x64 | Out-Null
+          Copy-Item target\release\luckymatch-desktop.exe dist\luckymatch-windows-x64\
+          Copy-Item target\release\luckymatch-cli.exe dist\luckymatch-windows-x64\
+          Copy-Item config.example.json dist\luckymatch-windows-x64\
+          Copy-Item README.md dist\luckymatch-windows-x64\
+          Compress-Archive -Path dist\luckymatch-windows-x64\* -DestinationPath dist\luckymatch-windows-x64.zip -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luckymatch-windows-x64
+          path: dist/luckymatch-windows-x64.zip
+
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain & Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK & NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK & cargo-ndk
+        run: |
+          sdkmanager "ndk;27.2.12479018" "platforms;android-35" "build-tools;35.0.0"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          cargo install cargo-ndk --locked
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Rust FFI .so libraries & UniFFI Kotlin bindings
+        run: |
+          mkdir -p android/app/src/main/jniLibs android/app/src/main/java
+          RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384" cargo ndk -t arm64-v8a -t x86_64 -o android/app/src/main/jniLibs build -p luckymatch-ffi --release
+          cargo run -p luckymatch-ffi --features bindgen-cli --bin uniffi-bindgen -- generate --library android/app/src/main/jniLibs/arm64-v8a/libluckymatch_ffi.so --language kotlin --out-dir android/app/src/main/java
+
+      - name: Build Android APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Stage APK artifact
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/luckymatch-android.apk
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luckymatch-android
+          path: dist/luckymatch-android.apk
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-windows, build-android]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/luckymatch-windows-x64/luckymatch-windows-x64.zip
+            artifacts/luckymatch-android/luckymatch-android.apk

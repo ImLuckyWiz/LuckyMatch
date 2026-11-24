@@ -1,0 +1,25 @@
+[package]
+name = "luckymatch-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UniFFI bindings for luckymatch-core (Android Kotlin/Compose & multi-language targets)"
+
+[lib]
+name = "luckymatch_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+bindgen-cli = ["uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+required-features = ["bindgen-cli"]
+
+[dependencies]
+luckymatch-core = { path = "../luckymatch-core" }
+uniffi = { version = "0.32", features = ["tokio"] }
+tokio.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
