@@ -5,12 +5,15 @@ import android.os.SystemClock
 import androidx.compose.ui.graphics.Color
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.luckymatch.app.BuildConfig
 import com.luckymatch.app.audio.AudioCaptureManager
 import com.luckymatch.app.audio.CaptureSource
 import com.luckymatch.app.audio.MediaProjectionService
 import com.luckymatch.app.audio.ProgressiveOutcome
 import com.luckymatch.app.data.Credentials
 import com.luckymatch.app.data.CredentialsStore
+import com.luckymatch.app.update.AppUpdater
+import com.luckymatch.app.update.ReleaseInfo
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -26,6 +29,7 @@ import uniffi.luckymatch_ffi.FfiLyricsResult
 import uniffi.luckymatch_ffi.FfiRecognizedTrack
 import uniffi.luckymatch_ffi.FfiSyncSnapshot
 import uniffi.luckymatch_ffi.LuckyMatchClient
+import java.io.File
 import kotlin.math.abs
 
 sealed interface RecognitionStatus {
@@ -35,6 +39,16 @@ sealed interface RecognitionStatus {
     data object SilentAudio : RecognitionStatus
     data object NoMatch : RecognitionStatus
     data class Error(val message: String) : RecognitionStatus
+}
+
+sealed interface UpdateState {
+    data object Idle : UpdateState
+    data object Checking : UpdateState
+    data object UpToDate : UpdateState
+    data class Available(val release: ReleaseInfo, val dismissed: Boolean = false) : UpdateState
+    data class Downloading(val release: ReleaseInfo, val progress: Float?) : UpdateState
+    data class ReadyToInstall(val release: ReleaseInfo, val apkFile: File) : UpdateState
+    data class Error(val message: String) : UpdateState
 }
 
 data class LuckyMatchUiState(
@@ -50,6 +64,7 @@ data class LuckyMatchUiState(
     val currentPosSec: Double = 0.0,
     val syncSnapshot: FfiSyncSnapshot? = null,
     val credentials: Credentials = Credentials(),
+    val updateState: UpdateState = UpdateState.Idle,
 )
 
 private data class AnchorClock(
@@ -94,7 +109,94 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
     private var identifyJob: Job? = null
     private var identifyIsManual: Boolean = false
     private var autoSyncJob: Job? = null
+    private var updateJob: Job? = null
     private var pendingSeekCandidate: Pair<Double, Long>? = null
+
+    init {
+        checkForUpdates(manual = false)
+    }
+
+    fun checkForUpdates(manual: Boolean = true) {
+        val current = _uiState.value.updateState
+        if (current is UpdateState.Checking || current is UpdateState.Downloading) return
+        if (manual && current is UpdateState.Available && current.dismissed) {
+            _uiState.update { it.copy(updateState = current.copy(dismissed = false)) }
+            return
+        }
+
+        updateJob?.cancel()
+        if (manual) {
+            _uiState.update { it.copy(updateState = UpdateState.Checking) }
+        }
+
+        updateJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val release = AppUpdater.checkLatestRelease(BuildConfig.VERSION_NAME)
+                if (release != null) {
+                    _uiState.update { it.copy(updateState = UpdateState.Available(release)) }
+                } else if (manual) {
+                    _uiState.update { it.copy(updateState = UpdateState.UpToDate) }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                if (manual) {
+                    _uiState.update {
+                        it.copy(updateState = UpdateState.Error(t.message ?: "Update check failed"))
+                    }
+                }
+            }
+        }
+    }
+
+    fun downloadUpdate() {
+        val release = when (val st = _uiState.value.updateState) {
+            is UpdateState.Available -> st.release
+            is UpdateState.ReadyToInstall -> st.release
+            else -> return
+        }
+        updateJob?.cancel()
+        _uiState.update { it.copy(updateState = UpdateState.Downloading(release, 0f)) }
+
+        updateJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val apkFile = AppUpdater.downloadApk(
+                    context = getApplication<Application>().applicationContext,
+                    release = release,
+                    onProgress = { progress ->
+                        _uiState.update {
+                            it.copy(updateState = UpdateState.Downloading(release, progress))
+                        }
+                    },
+                )
+                _uiState.update {
+                    it.copy(updateState = UpdateState.ReadyToInstall(release, apkFile))
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                _uiState.update {
+                    it.copy(updateState = UpdateState.Error(t.message ?: "Download failed"))
+                }
+            }
+        }
+    }
+
+    fun dismissUpdateBanner() {
+        _uiState.update { state ->
+            when (val st = state.updateState) {
+                is UpdateState.Available -> state.copy(updateState = st.copy(dismissed = true))
+                is UpdateState.Error, UpdateState.UpToDate -> state.copy(updateState = UpdateState.Idle)
+                else -> state
+            }
+        }
+    }
+
+    fun clearUpdateError() {
+        if (_uiState.value.updateState is UpdateState.Error) {
+            _uiState.update { it.copy(updateState = UpdateState.Idle) }
+        }
+    }
 
     fun saveCredentials(creds: Credentials) {
         store.save(creds)
@@ -487,6 +589,7 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     override fun onCleared() {
+        updateJob?.cancel()
         autoSyncJob?.cancel()
         identifyJob?.cancel()
         client.close()

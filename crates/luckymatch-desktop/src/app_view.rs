@@ -8,12 +8,14 @@ use gpui::{
     RenderImage, Rgba, SharedString, Task, Window,
 };
 use luckymatch_core::{
-    evaluate_lyrics, LyricsResult, LyricsSource, PlaybackClock, RecognizedTrack, SyllableProgress,
+    evaluate_lyrics, LyricsResult, LyricsSource, PlaybackClock, RecognizedTrack, ReleaseInfo,
+    SyllableProgress,
 };
 
 use crate::audio_capture::CaptureSource;
 use crate::backend::{
     decode_bgra_image, spawn_backend, BackendCommand, BackendEvent, BackendHandle, BackendStatus,
+    UpdateState,
 };
 use crate::win32_window;
 
@@ -43,6 +45,10 @@ pub struct LuckyMatchView {
     anim_started_at: Instant,
     pending_seek_candidate: Option<(f64, Instant)>,
     last_frame_at: Instant,
+
+    update_state: UpdateState,
+    update_dismissed: bool,
+    pending_quit_for_update: bool,
 }
 
 impl LuckyMatchView {
@@ -57,6 +63,11 @@ impl LuckyMatchView {
             let keep_going = this
                 .update(cx, |view, cx| {
                     let changed = view.drain_backend_events();
+                    if view.pending_quit_for_update {
+                        view.shutdown();
+                        cx.quit();
+                        return;
+                    }
                     let capturing = matches!(view.status, BackendStatus::Capturing { .. });
                     if changed || capturing {
                         cx.notify();
@@ -89,6 +100,9 @@ impl LuckyMatchView {
             anim_started_at: Instant::now(),
             pending_seek_candidate: None,
             last_frame_at: Instant::now(),
+            update_state: UpdateState::Idle,
+            update_dismissed: false,
+            pending_quit_for_update: false,
         }
     }
 
@@ -190,9 +204,53 @@ impl LuckyMatchView {
                         self.accent_rgb = accent_rgb;
                     }
                 }
+                BackendEvent::UpdateStateChanged(state) => {
+                    if matches!(state, UpdateState::Available(_)) {
+                        self.update_dismissed = false;
+                    }
+                    self.update_state = state;
+                }
+                BackendEvent::QuitForUpdate => {
+                    self.pending_quit_for_update = true;
+                }
             }
         }
         any
+    }
+
+    fn check_for_updates(&mut self) {
+        if matches!(
+            self.update_state,
+            UpdateState::Checking | UpdateState::Downloading { .. } | UpdateState::Launching { .. }
+        ) {
+            return;
+        }
+        if matches!(self.update_state, UpdateState::Available(_)) && self.update_dismissed {
+            self.update_dismissed = false;
+            return;
+        }
+        let _ = self
+            .backend
+            .cmd_tx
+            .send(BackendCommand::CheckForUpdates { manual: true });
+    }
+
+    fn install_update(&mut self, release: ReleaseInfo) {
+        self.update_dismissed = false;
+        let _ = self
+            .backend
+            .cmd_tx
+            .send(BackendCommand::InstallUpdate(release));
+    }
+
+    fn dismiss_update(&mut self) {
+        self.update_dismissed = true;
+        if matches!(
+            self.update_state,
+            UpdateState::Error(_) | UpdateState::UpToDate
+        ) {
+            self.update_state = UpdateState::Idle;
+        }
     }
 
     fn trigger_identify(&self) {
@@ -361,6 +419,29 @@ impl LuckyMatchView {
                     .flex()
                     .items_center()
                     .gap_1()
+                    .when(!self.compact_mode, |d| {
+                        let (label, highlight) = match &self.update_state {
+                            UpdateState::Checking => ("Checking…".to_string(), false),
+                            UpdateState::UpToDate => ("Up to date".to_string(), false),
+                            UpdateState::Available(_) => ("Update".to_string(), true),
+                            UpdateState::Downloading { .. } => ("Updating…".to_string(), true),
+                            UpdateState::Launching { .. } => ("Restarting…".to_string(), true),
+                            UpdateState::Idle | UpdateState::Error(_) => {
+                                (concat!("v", env!("CARGO_PKG_VERSION")).to_string(), false)
+                            }
+                        };
+                        d.child(pill_button(
+                            "btn-update-check",
+                            label,
+                            highlight,
+                            accent_bg,
+                            accent_border,
+                            cx.listener(|this, _, _, cx| {
+                                this.check_for_updates();
+                                cx.notify();
+                            }),
+                        ))
+                    })
                     .child(pill_button(
                         "toggle-compact",
                         if self.compact_mode { "Full" } else { "Overlay" },
@@ -416,6 +497,185 @@ impl LuckyMatchView {
                             .child("×"),
                     ),
             )
+    }
+
+    fn render_update_banner(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let accent_bg = self.accent_color(0.24);
+        let accent_border = self.accent_color(0.75);
+
+        match &self.update_state {
+            UpdateState::Available(info) if !self.update_dismissed => {
+                let release = info.clone();
+                let ver = info.version.clone();
+                div()
+                    .w_full()
+                    .px_4()
+                    .py_2()
+                    .bg(self.accent_color(0.14))
+                    .border_b_1()
+                    .border_color(self.accent_color(0.35))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(0xf8fafc))
+                            .truncate()
+                            .child(format!("Update available: v{ver}")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("btn-install-update")
+                                    .px_2p5()
+                                    .py(px(3.0))
+                                    .rounded_md()
+                                    .bg(self.accent_color(0.88))
+                                    .hover(|s| s.opacity(0.9))
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(0x070a10))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.install_update(release.clone());
+                                        cx.notify();
+                                    }))
+                                    .child("Update now"),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-dismiss-update")
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(rgba(0xffffff99))
+                                    .hover(|s| s.bg(rgba(0xffffff18)).text_color(rgb(0xffffff)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dismiss_update();
+                                        cx.notify();
+                                    }))
+                                    .child("×"),
+                            ),
+                    )
+                    .into_any_element()
+            }
+            UpdateState::Downloading { version, progress } => {
+                let pct = progress.map(|p| (p.clamp(0.0, 1.0) * 100.0).round() as u32);
+                let text = match pct {
+                    Some(p) => format!("Downloading v{version}… {p}%"),
+                    None => format!("Downloading v{version}…"),
+                };
+                let bar_frac = progress.unwrap_or(0.35).clamp(0.0, 1.0);
+                div()
+                    .w_full()
+                    .px_4()
+                    .py_2()
+                    .bg(self.accent_color(0.12))
+                    .border_b_1()
+                    .border_color(self.accent_color(0.30))
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(0xf8fafc))
+                            .child(text),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(3.0))
+                            .rounded_full()
+                            .bg(rgba(0xffffff1a))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(bar_frac))
+                                    .bg(self.accent_color(0.95)),
+                            ),
+                    )
+                    .into_any_element()
+            }
+            UpdateState::Launching { version } => div()
+                .w_full()
+                .px_4()
+                .py_2()
+                .bg(self.accent_color(0.16))
+                .border_b_1()
+                .border_color(self.accent_color(0.35))
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(0xf8fafc))
+                .child(format!(
+                    "Installing v{version}… LuckyMatch will restart shortly"
+                ))
+                .into_any_element(),
+            UpdateState::Error(msg) => div()
+                .w_full()
+                .px_4()
+                .py_2()
+                .bg(rgba(0xef444422))
+                .border_b_1()
+                .border_color(rgba(0xef444455))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xfca5a5))
+                        .truncate()
+                        .child(format!("Update failed: {}", truncate_str(msg, 46))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(pill_button(
+                            "btn-retry-update",
+                            "Retry",
+                            false,
+                            accent_bg,
+                            accent_border,
+                            cx.listener(|this, _, _, cx| {
+                                this.check_for_updates();
+                                cx.notify();
+                            }),
+                        ))
+                        .child(
+                            div()
+                                .id("btn-dismiss-update-err")
+                                .px_2()
+                                .py(px(3.0))
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(rgba(0xffffff99))
+                                .hover(|s| s.bg(rgba(0xffffff18)).text_color(rgb(0xffffff)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.dismiss_update();
+                                    cx.notify();
+                                }))
+                                .child("×"),
+                        ),
+                )
+                .into_any_element(),
+            _ => div().into_any_element(),
+        }
     }
 
     fn status_badge(&self) -> (SharedString, Rgba) {
@@ -1049,6 +1309,7 @@ impl Render for LuckyMatchView {
             ))
             .text_color(rgb(0xffffff))
             .child(self.render_titlebar(cx))
+            .child(self.render_update_banner(cx))
             .child(self.render_header(pos_sec))
             .child(self.render_lyrics_stage(pos_sec, cx))
             .child(self.render_controls(cx))

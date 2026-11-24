@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "0.1.1"
+  #define AppVersion "0.1.3"
 #endif
 
 [Setup]
@@ -23,6 +23,7 @@ OutputBaseFilename=luckymatch-setup-x64
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+CloseApplications=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -42,4 +43,4 @@ Name: "{group}\Uninstall LuckyMatch"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\LuckyMatch"; Filename: "{app}\luckymatch-desktop.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\luckymatch-desktop.exe"; Description: "{cm:LaunchProgram,LuckyMatch}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\luckymatch-desktop.exe"; Description: "{cm:LaunchProgram,LuckyMatch}"; Flags: nowait postinstall

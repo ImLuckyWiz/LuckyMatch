@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use gpui::RenderImage;
 use image::Frame;
 use luckymatch_core::{
-    LuckyMatchConfig, LuckyMatchEngine, LyricsQuery, LyricsResult, RecognizedTrack,
+    check_latest_release, download_asset_to_file, LuckyMatchConfig, LuckyMatchEngine,
+    LyricsQuery, LyricsResult, RecognizedTrack, ReleaseInfo, UpdateCheckResult,
 };
 use smallvec::SmallVec;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -35,12 +36,30 @@ pub enum BackendStatus {
     Error(String),
 }
 
+#[derive(Debug, Clone)]
+pub enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(ReleaseInfo),
+    Downloading {
+        version: String,
+        progress: Option<f32>,
+    },
+    Launching {
+        version: String,
+    },
+    Error(String),
+}
+
 #[derive(Debug)]
 pub enum BackendCommand {
     IdentifyNow,
     CancelIdentify,
     SetSource(CaptureSource),
     SetAutoSync(bool),
+    CheckForUpdates { manual: bool },
+    InstallUpdate(ReleaseInfo),
     Shutdown,
 }
 
@@ -57,6 +76,8 @@ pub enum BackendEvent {
         image: Arc<RenderImage>,
         accent_rgb: (u8, u8, u8),
     },
+    UpdateStateChanged(UpdateState),
+    QuitForUpdate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,10 +199,136 @@ struct WorkerState<'a> {
     current_sig: Option<TrackSignature>,
     lyrics_task: Option<tokio::task::JoinHandle<()>>,
     cover_task: Option<tokio::task::JoinHandle<()>>,
+    update_task: Option<tokio::task::JoinHandle<()>>,
     next_auto_at: Option<Instant>,
 }
 
 impl<'a> WorkerState<'a> {
+    fn start_update_check(&mut self, manual: bool) {
+        if let Some(h) = self.update_task.take() {
+            h.abort();
+        }
+        if manual {
+            let _ = self
+                .event_tx
+                .send(BackendEvent::UpdateStateChanged(UpdateState::Checking));
+        }
+
+        let client = self.engine.http_client().clone();
+        let tx = self.event_tx.clone();
+        let current_version = env!("CARGO_PKG_VERSION");
+
+        self.update_task = Some(tokio::spawn(async move {
+            match check_latest_release(&client, current_version).await {
+                Ok(UpdateCheckResult::UpdateAvailable(info)) => {
+                    let _ = tx.send(BackendEvent::UpdateStateChanged(UpdateState::Available(
+                        info,
+                    )));
+                }
+                Ok(UpdateCheckResult::UpToDate { .. }) => {
+                    if manual {
+                        let _ = tx.send(BackendEvent::UpdateStateChanged(UpdateState::UpToDate));
+                    }
+                }
+                Err(err) => {
+                    if manual {
+                        let _ = tx.send(BackendEvent::UpdateStateChanged(UpdateState::Error(
+                            err.to_string(),
+                        )));
+                    } else {
+                        tracing::debug!("Background update check skipped: {err}");
+                    }
+                }
+            }
+        }));
+    }
+
+    fn start_update_install(&mut self, release: ReleaseInfo) {
+        if let Some(h) = self.update_task.take() {
+            h.abort();
+        }
+
+        let client = self.engine.http_client().clone();
+        let tx = self.event_tx.clone();
+
+        self.update_task = Some(tokio::spawn(async move {
+            let Some(asset) = release.windows_installer_asset().cloned() else {
+                open_url_in_browser(&release.html_url);
+                let _ = tx.send(BackendEvent::UpdateStateChanged(UpdateState::Idle));
+                return;
+            };
+
+            let version = release.version.clone();
+            let _ = tx.send(BackendEvent::UpdateStateChanged(UpdateState::Downloading {
+                version: version.clone(),
+                progress: Some(0.0),
+            }));
+
+            let dest_path =
+                std::env::temp_dir().join(format!("luckymatch-setup-{version}-x64.exe"));
+            let expected_size = (asset.size > 0).then_some(asset.size);
+            let mut last_pct: i32 = -1;
+            let mut last_sent = Instant::now();
+
+            let download_res = download_asset_to_file(
+                &client,
+                &asset.download_url,
+                &dest_path,
+                expected_size,
+                |downloaded, total| {
+                    let progress = total
+                        .filter(|&t| t > 0)
+                        .map(|t| (downloaded as f64 / t as f64).clamp(0.0, 1.0) as f32);
+                    let pct = progress.map_or(-1, |p| (p * 100.0).floor() as i32);
+                    let should_emit =
+                        pct != last_pct || last_sent.elapsed() >= Duration::from_millis(120);
+                    if should_emit {
+                        last_pct = pct;
+                        last_sent = Instant::now();
+                        let _ = tx.send(BackendEvent::UpdateStateChanged(
+                            UpdateState::Downloading {
+                                version: version.clone(),
+                                progress,
+                            },
+                        ));
+                    }
+                },
+            )
+            .await;
+
+            if let Err(err) = download_res {
+                let _ = tx.send(BackendEvent::UpdateStateChanged(UpdateState::Error(
+                    err.to_string(),
+                )));
+                return;
+            }
+
+            let _ = tx.send(BackendEvent::UpdateStateChanged(UpdateState::Launching {
+                version: version.clone(),
+            }));
+
+            let is_installed = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|dir| dir.join("unins000.exe").exists()))
+                .unwrap_or(false);
+
+            let mut cmd = std::process::Command::new(&dest_path);
+            if is_installed {
+                cmd.args(["/SILENT", "/CLOSEAPPLICATIONS", "/NORESTART", "/SP-"]);
+            }
+
+            match cmd.spawn() {
+                Ok(_) => {
+                    let _ = tx.send(BackendEvent::QuitForUpdate);
+                }
+                Err(err) => {
+                    let _ = tx.send(BackendEvent::UpdateStateChanged(UpdateState::Error(
+                        format!("Failed to launch installer: {err}"),
+                    )));
+                }
+            }
+        }));
+    }
     fn schedule_retry_if_active(&mut self, secs: u64) {
         self.next_auto_at = if self.auto_sync && self.current_sig.is_some() {
             Some(Instant::now() + Duration::from_secs(secs))
@@ -352,6 +499,12 @@ async fn run_progressive_identify(state: &mut WorkerState<'_>) -> ProgressiveOut
                                             continue 'source_restart;
                                         }
                                         Some(BackendCommand::SetAutoSync(e)) => state.set_auto_sync(e),
+                                        Some(BackendCommand::CheckForUpdates { manual }) => {
+                                            state.start_update_check(manual);
+                                        }
+                                        Some(BackendCommand::InstallUpdate(rel)) => {
+                                            state.start_update_install(rel);
+                                        }
                                         Some(BackendCommand::IdentifyNow) => {}
                                         Some(BackendCommand::Shutdown) | None => {
                                             stream.stop();
@@ -401,6 +554,12 @@ async fn run_progressive_identify(state: &mut WorkerState<'_>) -> ProgressiveOut
                             continue 'source_restart;
                         }
                         Some(BackendCommand::SetAutoSync(e)) => state.set_auto_sync(e),
+                        Some(BackendCommand::CheckForUpdates { manual }) => {
+                            state.start_update_check(manual);
+                        }
+                        Some(BackendCommand::InstallUpdate(rel)) => {
+                            state.start_update_install(rel);
+                        }
                         Some(BackendCommand::IdentifyNow) => {}
                         Some(BackendCommand::Shutdown) | None => {
                             stream.stop();
@@ -458,6 +617,12 @@ async fn run_auto_sync_identify(state: &mut WorkerState<'_>) -> AutoSyncOutcome 
                         cancel.store(true, Ordering::Relaxed);
                     }
                     Some(BackendCommand::SetAutoSync(enabled)) => state.set_auto_sync(enabled),
+                    Some(BackendCommand::CheckForUpdates { manual }) => {
+                        state.start_update_check(manual);
+                    }
+                    Some(BackendCommand::InstallUpdate(rel)) => {
+                        state.start_update_install(rel);
+                    }
                     Some(BackendCommand::Shutdown) | None => {
                         cancel.store(true, Ordering::Relaxed);
                         let _ = capture_handle.await;
@@ -537,6 +702,12 @@ async fn run_auto_sync_identify(state: &mut WorkerState<'_>) -> AutoSyncOutcome 
                     Some(BackendCommand::IdentifyNow) => return AutoSyncOutcome::PromoteToManual,
                     Some(BackendCommand::SetSource(s)) => state.source = s,
                     Some(BackendCommand::SetAutoSync(e)) => state.set_auto_sync(e),
+                    Some(BackendCommand::CheckForUpdates { manual }) => {
+                        state.start_update_check(manual);
+                    }
+                    Some(BackendCommand::InstallUpdate(rel)) => {
+                        state.start_update_install(rel);
+                    }
                     Some(BackendCommand::Shutdown) | None => return AutoSyncOutcome::Shutdown,
                 }
             }
@@ -590,9 +761,12 @@ async fn worker_loop(
         current_sig: None,
         lyrics_task: None,
         cover_task: None,
+        update_task: None,
         // Wait for the user's first tap/R on launch; auto-sync starts once a track has been matched.
         next_auto_at: None,
     };
+
+    state.start_update_check(false);
 
     loop {
         let sleep_dur = match state.next_auto_at {
@@ -616,6 +790,12 @@ async fn worker_loop(
                     }
                     Some(BackendCommand::SetSource(s)) => state.source = s,
                     Some(BackendCommand::SetAutoSync(enabled)) => state.set_auto_sync(enabled),
+                    Some(BackendCommand::CheckForUpdates { manual }) => {
+                        state.start_update_check(manual);
+                    }
+                    Some(BackendCommand::InstallUpdate(rel)) => {
+                        state.start_update_install(rel);
+                    }
                     Some(BackendCommand::Shutdown) | None => break,
                 }
             }
@@ -646,6 +826,8 @@ async fn worker_loop(
                 }
                 BackendCommand::SetSource(s) => state.source = s,
                 BackendCommand::SetAutoSync(enabled) => state.set_auto_sync(enabled),
+                BackendCommand::CheckForUpdates { manual } => state.start_update_check(manual),
+                BackendCommand::InstallUpdate(rel) => state.start_update_install(rel),
                 BackendCommand::Shutdown => return,
             }
         }
@@ -760,4 +942,17 @@ fn extract_accent_rgb(rgba: &image::RgbaImage) -> (u8, u8, u8) {
     let g = ((g_sum / count) as u8).clamp(40, 235);
     let b = ((b_sum / count) as u8).clamp(40, 235);
     (r, g, b)
+}
+
+fn open_url_in_browser(url: &str) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
 }

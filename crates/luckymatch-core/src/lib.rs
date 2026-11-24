@@ -5,6 +5,7 @@ pub mod lyrics;
 pub mod metadata;
 pub mod recognition;
 pub mod sync;
+pub mod updater;
 
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,10 @@ pub use lyrics::{
 pub use metadata::{SpotifyResolver, SpotifyTrackInfo};
 pub use recognition::{recognize_pcm_16khz, RecognitionMatch};
 pub use sync::{evaluate_lyrics, PlaybackClock, SyllableProgress, SyncSnapshot};
+pub use updater::{
+    check_latest_release, download_asset_to_file, is_newer_version, ReleaseAsset, ReleaseInfo,
+    UpdateCheckResult,
+};
 
 /// Combined result of audio recognition, optional Spotify metadata resolution, and anchored clock.
 #[derive(Debug, Clone)]

@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -43,8 +44,10 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -75,6 +78,7 @@ import com.luckymatch.app.R
 import com.luckymatch.app.audio.CaptureSource
 import kotlinx.coroutines.isActive
 import uniffi.luckymatch_ffi.FfiLyricsSource
+import java.io.File
 import java.util.Locale
 import kotlin.math.floor
 
@@ -83,10 +87,20 @@ fun KaraokeScreen(
     viewModel: LuckyMatchViewModel,
     onRequestIdentify: (CaptureSource) -> Unit,
     onRequestSwitchSource: (CaptureSource) -> Unit,
+    onInstallApk: (File) -> Unit,
 ) {
     val state by viewModel.uiState.collectAsState()
     var showSettings by remember { mutableStateOf(false) }
     var captureElapsedTick by remember { mutableLongStateOf(0L) }
+    var lastAutoInstallVersion by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(state.updateState) {
+        val ready = state.updateState as? UpdateState.ReadyToInstall ?: return@LaunchedEffect
+        if (lastAutoInstallVersion != ready.release.version) {
+            lastAutoInstallVersion = ready.release.version
+            onInstallApk(ready.apkFile)
+        }
+    }
 
     val isPlaying = state.track != null && !state.isPaused
     val isCapturing = state.status is RecognitionStatus.Capturing
@@ -130,6 +144,15 @@ fun KaraokeScreen(
                 hasTrack = state.track != null,
                 nowMs = captureElapsedTick,
                 onOpenSettings = { showSettings = true },
+            )
+
+            UpdateBanner(
+                updateState = state.updateState,
+                accentColor = state.accentColor,
+                onDownload = viewModel::downloadUpdate,
+                onInstall = onInstallApk,
+                onRetry = { viewModel.checkForUpdates(manual = true) },
+                onDismiss = viewModel::dismissUpdateBanner,
             )
 
             if (state.track != null) {
@@ -214,9 +237,176 @@ fun KaraokeScreen(
     if (showSettings) {
         SettingsSheet(
             initial = state.credentials,
+            updateState = state.updateState,
+            onCheckForUpdates = { viewModel.checkForUpdates(manual = true) },
+            onDownloadUpdate = viewModel::downloadUpdate,
+            onInstallApk = onInstallApk,
             onSave = viewModel::saveCredentials,
             onDismiss = { showSettings = false },
         )
+    }
+}
+
+@Composable
+private fun UpdateBanner(
+    updateState: UpdateState,
+    accentColor: Color,
+    onDownload: () -> Unit,
+    onInstall: (File) -> Unit,
+    onRetry: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val show = when (updateState) {
+        is UpdateState.Available -> !updateState.dismissed
+        is UpdateState.Downloading,
+        is UpdateState.ReadyToInstall,
+        is UpdateState.Error -> true
+        UpdateState.Idle,
+        UpdateState.Checking,
+        UpdateState.UpToDate -> false
+    }
+    if (!show) return
+
+    val bg = if (updateState is UpdateState.Error) {
+        Color(0xFFEF4444).copy(alpha = 0.16f)
+    } else {
+        accentColor.copy(alpha = 0.15f)
+    }
+    val border = if (updateState is UpdateState.Error) {
+        Color(0xFFEF4444).copy(alpha = 0.4f)
+    } else {
+        accentColor.copy(alpha = 0.35f)
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 4.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(bg)
+            .border(1.dp, border, RoundedCornerShape(10.dp))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        when (updateState) {
+            is UpdateState.Available -> {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = "Update available: v${updateState.release.version}",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color.White,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = onDownload) {
+                            Text(
+                                text = "Update",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = accentColor,
+                            )
+                        }
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.size(28.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Dismiss update",
+                                tint = Color.White.copy(alpha = 0.65f),
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                    }
+                }
+            }
+            is UpdateState.Downloading -> {
+                val pctText = updateState.progress?.let { "${(it * 100f).toInt()}%" } ?: ""
+                Text(
+                    text = "Downloading v${updateState.release.version}… $pctText".trim(),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = Color.White,
+                )
+                if (updateState.progress != null) {
+                    LinearProgressIndicator(
+                        progress = { updateState.progress.coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth(),
+                        color = accentColor,
+                        trackColor = Color.White.copy(alpha = 0.14f),
+                    )
+                } else {
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = accentColor,
+                        trackColor = Color.White.copy(alpha = 0.14f),
+                    )
+                }
+            }
+            is UpdateState.ReadyToInstall -> {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = "v${updateState.release.version} ready to install",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color.White,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = { onInstall(updateState.apkFile) }) {
+                        Text(
+                            text = "Install",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = accentColor,
+                        )
+                    }
+                }
+            }
+            is UpdateState.Error -> {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = "Update failed: ${updateState.message}",
+                        fontSize = 12.sp,
+                        color = Color(0xFFFCA5A5),
+                        modifier = Modifier.weight(1f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = onRetry) {
+                            Text("Retry", fontSize = 12.sp, color = Color.White)
+                        }
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.size(28.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Dismiss error",
+                                tint = Color.White.copy(alpha = 0.65f),
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                    }
+                }
+            }
+            else -> {}
+        }
     }
 }
 
