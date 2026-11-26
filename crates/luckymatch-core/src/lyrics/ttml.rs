@@ -287,6 +287,43 @@ fn attr_ttm<'a>(node: &roxmltree::Node<'a, '_>, local: &str) -> Option<&'a str> 
         })
 }
 
+/// Parse song duration from TTML `<body dur="...">` / `<body end="...">` or `<div end="...">`.
+pub fn parse_ttml_duration_ms(xml: &str) -> Option<u64> {
+    let trimmed = xml.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let doc = roxmltree::Document::parse(trimmed).ok()?;
+    let mut best_sec: Option<f64> = None;
+
+    for node in doc.descendants().filter(|n| n.is_element()) {
+        match node.tag_name().name() {
+            "body" => {
+                for attr in ["dur", "end"] {
+                    if let Some(sec) = attr_any(&node, attr)
+                        .and_then(parse_time_str)
+                        .filter(|s| s.is_finite() && *s > 0.0)
+                    {
+                        best_sec = Some(best_sec.map_or(sec, |b| b.max(sec)));
+                    }
+                }
+            }
+            "div" => {
+                if let Some(sec) = attr_any(&node, "end")
+                    .and_then(parse_time_str)
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                {
+                    best_sec = Some(best_sec.map_or(sec, |b| b.max(sec)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    best_sec.map(|sec| (sec * 1000.0).round() as u64)
+}
+
 /// Parse TTML timestamp strings (`hh:mm:ss.fff`, `mm:ss.fff`, `ss.fff`, `12.3s`, `1230ms`).
 pub fn parse_time_str(raw: &str) -> Option<f64> {
     let s = raw.trim();
@@ -363,5 +400,26 @@ mod tests {
         assert_eq!(line.background[0].syllables.len(), 2);
         assert_eq!(line.background[0].syllables[0].text, "(oh");
         assert!(!line.background[0].syllables[0].is_part_of_word);
+    }
+
+    #[test]
+    fn parses_ttml_body_dur_and_handles_missing_dur() {
+        let with_dur = r#"
+        <tt xmlns="http://www.w3.org/ns/ttml">
+          <body dur="03:32.450">
+            <div><p begin="00:05.000" end="00:08.000">Hello</p></div>
+          </body>
+        </tt>
+        "#;
+        assert_eq!(parse_ttml_duration_ms(with_dur), Some(212_450));
+
+        let without_dur = r#"
+        <tt xmlns="http://www.w3.org/ns/ttml">
+          <body>
+            <div><p begin="00:05.000" end="00:08.000">Hello</p></div>
+          </body>
+        </tt>
+        "#;
+        assert_eq!(parse_ttml_duration_ms(without_dur), None);
     }
 }

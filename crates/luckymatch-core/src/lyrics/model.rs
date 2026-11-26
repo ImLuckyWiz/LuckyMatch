@@ -56,6 +56,8 @@ pub struct LyricsDocument {
 pub struct LyricsResult {
     pub document: LyricsDocument,
     pub source: LyricsSource,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 impl LyricsResult {
@@ -79,6 +81,20 @@ impl LyricsResult {
 }
 
 impl LyricsDocument {
+    /// Return the latest synchronized lyric end time in seconds (ignoring static lyrics).
+    pub fn synced_end_time_sec(&self) -> Option<f64> {
+        if self.kind == LyricsKind::Static || self.lines.is_empty() {
+            return None;
+        }
+        self.lines
+            .iter()
+            .filter_map(|line| {
+                let end = line.end_time;
+                (end.is_finite() && end > 0.0).then_some(end)
+            })
+            .reduce(f64::max)
+    }
+
     /// Parse either Spicy Lyrics API `Body` JSON or `LuckySpotifyQueue`-compatible cached JSON.
     pub fn from_spicy_or_cache_json(value: &Value) -> Option<Self> {
         let type_str = value.get("Type").and_then(Value::as_str)?;
@@ -339,6 +355,35 @@ fn vocal_track_to_json(track: &VocalTrack) -> Value {
     })
 }
 
+pub(crate) fn extract_spicy_duration_ms(value: &Value) -> Option<u64> {
+    let mut max_sec = value
+        .get("EndTime")
+        .and_then(Value::as_f64)
+        .filter(|t| t.is_finite() && *t > 0.0)
+        .unwrap_or(0.0);
+
+    if let Some(content) = value.get("Content").and_then(Value::as_array) {
+        for item in content {
+            if let Some(t) = item
+                .get("EndTime")
+                .and_then(Value::as_f64)
+                .filter(|t| t.is_finite() && *t > 0.0)
+            {
+                max_sec = max_sec.max(t);
+            }
+            if let Some(t) = item
+                .pointer("/Lead/EndTime")
+                .and_then(Value::as_f64)
+                .filter(|t| t.is_finite() && *t > 0.0)
+            {
+                max_sec = max_sec.max(t);
+            }
+        }
+    }
+
+    (max_sec > 0.0).then(|| (max_sec * 1000.0).round() as u64)
+}
+
 pub(crate) fn join_syllables_text(syllables: &[Syllable], _translit: bool) -> String {
     let mut out = String::new();
     for (i, syl) in syllables.iter().enumerate() {
@@ -429,6 +474,7 @@ mod tests {
                 song_writers: Vec::new(),
             },
             source,
+            duration_ms: None,
         };
         let spicy = make(LyricsKind::Syllable, LyricsSource::SpicyLyrics);
         let amll = make(LyricsKind::Syllable, LyricsSource::Amll);
@@ -440,5 +486,98 @@ mod tests {
         assert!(amll.quality_score() > netease_syl.quality_score());
         assert!(netease_syl.quality_score() > netease_line.quality_score());
         assert!(netease_line.quality_score() > lrclib.quality_score());
+    }
+
+    #[test]
+    fn synced_end_time_ignores_static_and_empty_documents() {
+        let static_doc = LyricsDocument {
+            kind: LyricsKind::Static,
+            lines: vec![LyricsLine {
+                start_time: 10.0,
+                end_time: 120.0,
+                opposite_aligned: false,
+                lead: VocalTrack {
+                    start_time: 10.0,
+                    end_time: 120.0,
+                    syllables: vec![],
+                },
+                background: vec![],
+                text: "Static".into(),
+                transliterated_text: None,
+            }],
+            song_writers: vec![],
+        };
+        assert_eq!(static_doc.synced_end_time_sec(), None);
+
+        let empty_doc = LyricsDocument {
+            kind: LyricsKind::Line,
+            lines: vec![],
+            song_writers: vec![],
+        };
+        assert_eq!(empty_doc.synced_end_time_sec(), None);
+
+        let line_doc = LyricsDocument {
+            kind: LyricsKind::Line,
+            lines: vec![
+                LyricsLine {
+                    start_time: 10.0,
+                    end_time: 15.0,
+                    opposite_aligned: false,
+                    lead: VocalTrack {
+                        start_time: 10.0,
+                        end_time: 15.0,
+                        syllables: vec![],
+                    },
+                    background: vec![],
+                    text: "A".into(),
+                    transliterated_text: None,
+                },
+                LyricsLine {
+                    start_time: 20.0,
+                    end_time: 198.5,
+                    opposite_aligned: false,
+                    lead: VocalTrack {
+                        start_time: 20.0,
+                        end_time: 198.5,
+                        syllables: vec![],
+                    },
+                    background: vec![],
+                    text: "B".into(),
+                    transliterated_text: None,
+                },
+            ],
+            song_writers: vec![],
+        };
+        assert_eq!(line_doc.synced_end_time_sec(), Some(198.5));
+    }
+
+    #[test]
+    fn extracts_spicy_duration_including_trailing_instrumental() {
+        let body = json!({
+            "Type": "Syllable",
+            "EndTime": 180.0,
+            "Content": [
+                {
+                    "Type": "Vocal",
+                    "Lead": { "StartTime": 10.0, "EndTime": 175.25, "Syllables": [] }
+                },
+                {
+                    "Type": "Instrumental",
+                    "StartTime": 175.5,
+                    "EndTime": 205.75
+                }
+            ]
+        });
+        assert_eq!(extract_spicy_duration_ms(&body), Some(205_750));
+
+        let top_only = json!({
+            "Type": "Line",
+            "EndTime": 192.4,
+            "Content": []
+        });
+        assert_eq!(extract_spicy_duration_ms(&top_only), Some(192_400));
+
+        let none_payload = json!({ "Type": "Line", "Content": [] });
+        assert_eq!(extract_spicy_duration_ms(&none_payload), None);
     }
 }

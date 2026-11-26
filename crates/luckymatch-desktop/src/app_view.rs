@@ -8,8 +8,8 @@ use gpui::{
     RenderImage, Rgba, SharedString, Task, Window,
 };
 use luckymatch_core::{
-    evaluate_lyrics, LyricsResult, LyricsSource, PlaybackClock, RecognizedTrack, ReleaseInfo,
-    SyllableProgress,
+    compute_song_end_trigger_sec, evaluate_lyrics, LyricsResult, LyricsSource, PlaybackClock,
+    RecognizedTrack, ReleaseInfo, SyllableProgress,
 };
 
 use crate::audio_capture::CaptureSource;
@@ -45,6 +45,7 @@ pub struct LuckyMatchView {
     anim_started_at: Instant,
     pending_seek_candidate: Option<(f64, Instant)>,
     last_frame_at: Instant,
+    song_end_triggered: bool,
 
     update_state: UpdateState,
     update_dismissed: bool,
@@ -63,13 +64,14 @@ impl LuckyMatchView {
             let keep_going = this
                 .update(cx, |view, cx| {
                     let changed = view.drain_backend_events();
+                    let triggered = view.check_song_finished();
                     if view.pending_quit_for_update {
                         view.shutdown();
                         cx.quit();
                         return;
                     }
                     let capturing = matches!(view.status, BackendStatus::Capturing { .. });
-                    if changed || capturing {
+                    if changed || triggered || capturing {
                         cx.notify();
                     }
                 })
@@ -100,6 +102,7 @@ impl LuckyMatchView {
             anim_started_at: Instant::now(),
             pending_seek_candidate: None,
             last_frame_at: Instant::now(),
+            song_end_triggered: false,
             update_state: UpdateState::Idle,
             update_dismissed: false,
             pending_quit_for_update: false,
@@ -122,13 +125,14 @@ impl LuckyMatchView {
                     track,
                     same_song,
                     is_manual,
+                    force_resync,
                 } => {
                     if same_song {
                         if let Some(existing_clock) = &mut self.clock {
                             let predicted = existing_clock.position_now();
                             let measured = track.clock.position_now();
                             let drift = (measured - predicted).abs();
-                            if is_manual {
+                            if is_manual || force_resync {
                                 existing_clock.resync(
                                     measured,
                                     track.recognition.timeskew,
@@ -169,6 +173,7 @@ impl LuckyMatchView {
                             self.pending_seek_candidate = None;
                         }
                         self.track = Some(track);
+                        self.reset_song_end_if_before_trigger();
                     } else {
                         self.clock = Some(track.clock.clone());
                         self.track = Some(track);
@@ -177,6 +182,8 @@ impl LuckyMatchView {
                         self.cover_url = None;
                         self.visual_focus = 0.0;
                         self.pending_seek_candidate = None;
+                        self.song_end_triggered = false;
+                        self.maybe_defer_mid_song_reverify();
                     }
                 }
                 BackendEvent::LyricsUpdated(res) => {
@@ -186,6 +193,7 @@ impl LuckyMatchView {
                         .is_none_or(|existing| res.quality_score() > existing.quality_score());
                     if should_replace {
                         self.lyrics = Some(res);
+                        self.reset_song_end_if_before_trigger();
                     }
                 }
                 BackendEvent::CoverLoaded {
@@ -274,12 +282,100 @@ impl LuckyMatchView {
             .send(BackendCommand::SetSource(self.source));
     }
 
+    fn known_duration_ms(&self) -> Option<u64> {
+        self.track
+            .as_ref()
+            .and_then(|t| t.spotify.as_ref().map(|s| s.duration_ms))
+            .filter(|&d| d > 0)
+            .or_else(|| self.lyrics.as_ref().and_then(|l| l.duration_ms).filter(|&d| d > 0))
+    }
+
+    fn song_end_trigger_sec(&self) -> Option<f64> {
+        self.track.as_ref()?;
+        compute_song_end_trigger_sec(
+            self.known_duration_ms(),
+            self.lyrics.as_ref().map(|l| &l.document),
+        )
+    }
+
+    fn maybe_defer_mid_song_reverify(&self) {
+        if !self.auto_sync {
+            return;
+        }
+        let Some(clock) = &self.clock else {
+            return;
+        };
+        if clock.is_paused() {
+            return;
+        }
+        let Some(trigger_sec) = self.song_end_trigger_sec() else {
+            return;
+        };
+        if trigger_sec - clock.position_now() <= 63.0 {
+            let _ = self.backend.cmd_tx.send(BackendCommand::DeferMidSongReverify);
+        }
+    }
+
+    fn reset_song_end_if_before_trigger(&mut self) {
+        if let Some(trigger) = self.song_end_trigger_sec() {
+            if self
+                .clock
+                .as_ref()
+                .is_some_and(|c| c.position_now() < trigger - 2.0)
+            {
+                self.song_end_triggered = false;
+            }
+        }
+        self.maybe_defer_mid_song_reverify();
+    }
+
+    fn check_song_finished(&mut self) -> bool {
+        if !self.auto_sync || self.song_end_triggered {
+            return false;
+        }
+        let is_busy = matches!(
+            self.status,
+            BackendStatus::Capturing { .. } | BackendStatus::Identifying
+        );
+        if is_busy {
+            return false;
+        }
+        let Some(clock) = &self.clock else {
+            return false;
+        };
+        if clock.is_paused() {
+            return false;
+        }
+        let Some(trigger_sec) = self.song_end_trigger_sec() else {
+            return false;
+        };
+        let pos_now = clock.position_now();
+        if pos_now < trigger_sec {
+            return false;
+        }
+
+        self.song_end_triggered = true;
+        let duration_sec = self.known_duration_ms().map(|d| d as f64 / 1000.0);
+        let _ = self.backend.cmd_tx.send(BackendCommand::IdentifyNextSong {
+            prev_pos_sec: pos_now,
+            duration_sec,
+        });
+        true
+    }
+
     fn toggle_auto_sync(&mut self) {
         self.auto_sync = !self.auto_sync;
+        if !self.auto_sync {
+            self.song_end_triggered = false;
+        }
         let _ = self
             .backend
             .cmd_tx
             .send(BackendCommand::SetAutoSync(self.auto_sync));
+        if self.auto_sync {
+            self.maybe_defer_mid_song_reverify();
+            self.check_song_finished();
+        }
     }
 
     fn toggle_pin(&mut self, window: &mut Window) {
@@ -300,20 +396,34 @@ impl LuckyMatchView {
         if let Some(clock) = &mut self.clock {
             clock.nudge(delta);
         }
+        self.reset_song_end_if_before_trigger();
     }
 
     fn reset_offset(&mut self) {
         if let Some(clock) = &mut self.clock {
             clock.set_manual_offset(0.0);
         }
+        self.reset_song_end_if_before_trigger();
     }
 
     fn toggle_pause(&mut self) {
-        if let Some(clock) = &mut self.clock {
+        let paused = if let Some(clock) = &mut self.clock {
             if clock.is_paused() {
                 clock.resume();
             } else {
                 clock.pause();
+            }
+            Some(clock.is_paused())
+        } else {
+            None
+        };
+        if let Some(is_paused) = paused {
+            let _ = self
+                .backend
+                .cmd_tx
+                .send(BackendCommand::SetPlaybackPaused(is_paused));
+            if !is_paused {
+                self.maybe_defer_mid_song_reverify();
             }
         }
     }

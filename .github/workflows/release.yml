@@ -42,7 +42,7 @@ jobs:
           if (-not (Test-Path $iscc)) {
             choco install innosetup -y --no-progress
           }
-          $appVer = if ($env:GITHUB_REF_NAME -match '^v(.+)$') { $matches[1] } else { "0.1.3" }
+          $appVer = if ($env:GITHUB_REF_NAME -match '^v(.+)$') { $matches[1] } else { "0.1.4" }
           & $iscc "/DAppVersion=$appVer" packaging\windows\luckymatch.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

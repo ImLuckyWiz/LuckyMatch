@@ -5,6 +5,24 @@ use serde::{Deserialize, Serialize};
 use crate::lyrics::model::{LyricsDocument, LyricsLine, VocalTrack};
 
 pub const DEFAULT_HOLD_GAP_SEC: f64 = 2.5;
+pub const SONG_END_DURATION_BUFFER_SEC: f64 = 1.5;
+pub const SONG_END_LYRICS_BUFFER_SEC: f64 = 4.0;
+
+/// Compute the playback position (in seconds) at which a song is considered finished.
+pub fn compute_song_end_trigger_sec(
+    duration_ms: Option<u64>,
+    lyrics: Option<&LyricsDocument>,
+) -> Option<f64> {
+    let lyrics_end = lyrics.and_then(LyricsDocument::synced_end_time_sec);
+    let track_dur = duration_ms.filter(|&d| d > 0).map(|d| d as f64 / 1000.0);
+
+    match (track_dur, lyrics_end) {
+        (Some(dur), Some(le)) => Some(dur.max(le) + SONG_END_DURATION_BUFFER_SEC),
+        (Some(dur), None) => Some(dur + SONG_END_DURATION_BUFFER_SEC),
+        (None, Some(le)) => Some(le + SONG_END_LYRICS_BUFFER_SEC),
+        (None, None) => None,
+    }
+}
 
 /// Tracks live playback position from an audio capture anchor + Shazam offset/timeskew.
 #[derive(Debug, Clone)]
@@ -297,5 +315,46 @@ mod tests {
         let gap = evaluate_lyrics(&doc, 15.0, DEFAULT_HOLD_GAP_SEC);
         assert!(gap.in_instrumental_gap);
         assert_eq!(gap.focus_index, Some(1));
+    }
+
+    #[test]
+    fn computes_song_end_trigger_across_duration_and_lyrics_combinations() {
+        let make_doc = |kind: LyricsKind, end_time: f64| LyricsDocument {
+            kind,
+            song_writers: vec![],
+            lines: vec![LyricsLine {
+                start_time: 10.0,
+                end_time,
+                opposite_aligned: false,
+                lead: VocalTrack {
+                    start_time: 10.0,
+                    end_time,
+                    syllables: vec![],
+                },
+                background: vec![],
+                text: "End".into(),
+                transliterated_text: None,
+            }],
+        };
+
+        assert_eq!(compute_song_end_trigger_sec(Some(200_000), None), Some(201.5));
+        let shorter_lyrics = make_doc(LyricsKind::Syllable, 190.0);
+        assert_eq!(
+            compute_song_end_trigger_sec(Some(200_000), Some(&shorter_lyrics)),
+            Some(201.5)
+        );
+        let longer_lyrics = make_doc(LyricsKind::Line, 205.0);
+        assert_eq!(
+            compute_song_end_trigger_sec(Some(200_000), Some(&longer_lyrics)),
+            Some(206.5)
+        );
+        assert_eq!(
+            compute_song_end_trigger_sec(None, Some(&shorter_lyrics)),
+            Some(194.0)
+        );
+        let static_lyrics = make_doc(LyricsKind::Static, 190.0);
+        assert_eq!(compute_song_end_trigger_sec(None, Some(&static_lyrics)), None);
+        assert_eq!(compute_song_end_trigger_sec(Some(0), None), None);
+        assert_eq!(compute_song_end_trigger_sec(None, None), None);
     }
 }

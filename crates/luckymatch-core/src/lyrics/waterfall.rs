@@ -6,9 +6,11 @@ use tokio::sync::mpsc;
 use crate::config::LuckyMatchConfig;
 use crate::lyrics::cache::{cache_key_for_query, check_custom_lyrics, load_cache, save_cache};
 use crate::lyrics::lrc::parse_lrc;
-use crate::lyrics::model::{LyricsDocument, LyricsKind, LyricsResult, LyricsSource};
+use crate::lyrics::model::{
+    extract_spicy_duration_ms, LyricsDocument, LyricsKind, LyricsResult, LyricsSource,
+};
 use crate::lyrics::normalize::{clean_title, primary_artist};
-use crate::lyrics::ttml::parse_ttml;
+use crate::lyrics::ttml::{parse_ttml, parse_ttml_duration_ms};
 use crate::lyrics::yrc::parse_yrc;
 
 const FAST_TIMEOUT: Duration = Duration::from_millis(3500);
@@ -72,6 +74,7 @@ async fn run_waterfall(
             let _ = tx.send(LyricsResult {
                 document: doc,
                 source: LyricsSource::Custom,
+                duration_ms: None,
             });
             return;
         }
@@ -86,6 +89,7 @@ async fn run_waterfall(
             let res = LyricsResult {
                 document: cached,
                 source: LyricsSource::Cache,
+                duration_ms: None,
             };
             let score = res.quality_score();
             best_score = best_score.max(score);
@@ -116,10 +120,11 @@ async fn run_waterfall(
         tokio::select! {
             res = handle => {
                 spicy_handle = None;
-                if let Ok(Some(doc)) = res {
+                if let Ok(Some((doc, duration_ms))) = res {
                     let result = LyricsResult {
                         document: doc,
                         source: LyricsSource::SpicyLyrics,
+                        duration_ms,
                     };
                     let score = result.quality_score();
                     if score > best_score {
@@ -145,10 +150,11 @@ async fn run_waterfall(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        if let Some(doc) = fetch_from_amll(&client, track_id).await {
+        if let Some((doc, duration_ms)) = fetch_from_amll(&client, track_id).await {
             let result = LyricsResult {
                 document: doc,
                 source: LyricsSource::Amll,
+                duration_ms,
             };
             let score = result.quality_score();
             if score > best_score {
@@ -165,10 +171,11 @@ async fn run_waterfall(
     }
 
     // 5. NetEase Cloud Music (YRC syllable or LRC line) — never cancels pending Spicy Lyrics!
-    if let Some(doc) = fetch_from_netease(&client, &query).await {
+    if let Some((doc, duration_ms)) = fetch_from_netease(&client, &query).await {
         let result = LyricsResult {
             document: doc,
             source: LyricsSource::NetEase,
+            duration_ms,
         };
         let score = result.quality_score();
         if score > best_score {
@@ -185,10 +192,11 @@ async fn run_waterfall(
 
     // 6. LRCLIB fallback (only if nothing better has arrived yet)
     if best_score == 0 {
-        if let Some(doc) = fetch_from_lrclib(&client, &query).await {
+        if let Some((doc, duration_ms)) = fetch_from_lrclib(&client, &query).await {
             let result = LyricsResult {
                 document: doc,
                 source: LyricsSource::LrcLib,
+                duration_ms,
             };
             let score = result.quality_score();
             if score > best_score {
@@ -204,10 +212,11 @@ async fn run_waterfall(
     // Wait for slow Spicy Lyrics task if still running so it can upgrade NetEase/LRCLIB.
     if best_score < 90 {
         if let Some(handle) = spicy_handle {
-            if let Ok(Some(doc)) = handle.await {
+            if let Ok(Some((doc, duration_ms))) = handle.await {
                 let result = LyricsResult {
                     document: doc,
                     source: LyricsSource::SpicyLyrics,
+                    duration_ms,
                 };
                 if result.quality_score() > best_score {
                     if let Some(cache_dir) = &config.cache_dir {
@@ -224,7 +233,7 @@ async fn fetch_from_spicy_lyrics(
     client: &reqwest::Client,
     track_id: &str,
     api_key: &str,
-) -> Option<LyricsDocument> {
+) -> Option<(LyricsDocument, Option<u64>)> {
     let url = format!(
         "https://api.spicylyrics.org/v1/lyrics/{}",
         urlencoding::encode(track_id)
@@ -244,10 +253,14 @@ async fn fetch_from_spicy_lyrics(
 
     let json: Value = resp.json().await.ok()?;
     let body = json.get("Body")?;
-    LyricsDocument::from_spicy_or_cache_json(body)
+    let doc = LyricsDocument::from_spicy_or_cache_json(body)?;
+    Some((doc, extract_spicy_duration_ms(body)))
 }
 
-async fn fetch_from_amll(client: &reqwest::Client, track_id: &str) -> Option<LyricsDocument> {
+async fn fetch_from_amll(
+    client: &reqwest::Client,
+    track_id: &str,
+) -> Option<(LyricsDocument, Option<u64>)> {
     let url = format!(
         "https://raw.githubusercontent.com/amll-dev/amll-ttml-db/main/spotify-lyrics/{}.ttml",
         urlencoding::encode(track_id)
@@ -257,13 +270,14 @@ async fn fetch_from_amll(client: &reqwest::Client, track_id: &str) -> Option<Lyr
         return None;
     }
     let text = resp.text().await.ok()?;
-    parse_ttml(&text)
+    let doc = parse_ttml(&text)?;
+    Some((doc, parse_ttml_duration_ms(&text)))
 }
 
 async fn fetch_from_netease(
     client: &reqwest::Client,
     query: &LyricsQuery,
-) -> Option<LyricsDocument> {
+) -> Option<(LyricsDocument, Option<u64>)> {
     let title = clean_title(&query.title);
     let artist = primary_artist(&query.artist);
     let search_q = format!("{title} {artist}");
@@ -307,6 +321,10 @@ async fn fetch_from_netease(
         &songs[0]
     };
 
+    let dt_ms = candidate
+        .get("dt")
+        .and_then(Value::as_u64)
+        .filter(|&d| d > 0);
     let song_id = candidate.get("id")?.as_u64()?;
     let lyric_url =
         format!("https://music.163.com/api/song/lyric?id={song_id}&lv=-1&tv=-1&rv=-1&yv=-1");
@@ -324,19 +342,22 @@ async fn fetch_from_netease(
     let lyric_json: Value = lyric_resp.json().await.ok()?;
     if let Some(yrc) = lyric_json.pointer("/yrc/lyric").and_then(Value::as_str) {
         if let Some(doc) = parse_yrc(yrc) {
-            return Some(doc);
+            return Some((doc, dt_ms));
         }
     }
     if let Some(lrc) = lyric_json.pointer("/lrc/lyric").and_then(Value::as_str) {
-        if let Some(doc) = parse_lrc(lrc, query.duration_ms) {
-            return Some(doc);
+        if let Some(doc) = parse_lrc(lrc, query.duration_ms.or(dt_ms)) {
+            return Some((doc, dt_ms));
         }
     }
 
     None
 }
 
-async fn fetch_from_lrclib(client: &reqwest::Client, query: &LyricsQuery) -> Option<LyricsDocument> {
+async fn fetch_from_lrclib(
+    client: &reqwest::Client,
+    query: &LyricsQuery,
+) -> Option<(LyricsDocument, Option<u64>)> {
     let title = clean_title(&query.title);
     let artist = primary_artist(&query.artist);
     let use_title = if title.is_empty() {
@@ -372,6 +393,12 @@ async fn fetch_from_lrclib(client: &reqwest::Client, query: &LyricsQuery) -> Opt
     }
 
     let json: Value = resp.json().await.ok()?;
+    let dur_ms = json
+        .get("duration")
+        .and_then(Value::as_f64)
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .map(|s| (s * 1000.0).round() as u64);
     let synced = json.get("syncedLyrics").and_then(Value::as_str)?;
-    parse_lrc(synced, query.duration_ms)
+    let doc = parse_lrc(synced, query.duration_ms.or(dur_ms))?;
+    Some((doc, dur_ms))
 }

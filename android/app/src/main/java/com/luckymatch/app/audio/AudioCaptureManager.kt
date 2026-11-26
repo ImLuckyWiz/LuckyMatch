@@ -127,6 +127,7 @@ object AudioCaptureManager {
         silenceRmsThreshold: Float = 0.0005f,
         maxWindowSeconds: Float = 12.0f,
         maxTotalSeconds: Float = 45.0f,
+        silenceTimeoutSeconds: Float? = null,
         onAudioLevel: (Float) -> Unit = {},
         onTryMatch: suspend (CapturedAudio) -> Boolean,
     ): ProgressiveOutcome {
@@ -151,6 +152,8 @@ object AudioCaptureManager {
         var totalReceivedSamples = 0L
         var readerError: Throwable? = null
         val stopRequested = AtomicBoolean(false)
+        val hadAudioActivity = AtomicBoolean(false)
+        val startedAtMs = SystemClock.elapsedRealtime()
 
         return coroutineScope {
             var readerJob: kotlinx.coroutines.Job? = null
@@ -178,6 +181,9 @@ object AudioCaptureManager {
                                 }
                             }
                             smoothedLevel = updateSmoothedLevel(chunk, readCount, smoothedLevel)
+                            if (smoothedLevel >= 0.003f) {
+                                hadAudioActivity.set(true)
+                            }
                             onAudioLevel(smoothedLevel)
                         } else if (readCount < 0 && !stopRequested.get()) {
                             synchronized(lock) {
@@ -188,7 +194,7 @@ object AudioCaptureManager {
                     }
                 }
 
-                val deadlineMs = SystemClock.elapsedRealtime() + ((maxTotalSeconds + 3.0f) * 1000L).toLong()
+                val deadlineMs = startedAtMs + ((maxTotalSeconds + 3.0f) * 1000L).toLong()
                 var checkpointIdx = 0
                 var nextCheckSec = PROGRESSIVE_CHECKPOINTS[0]
                 var hadNonSilent = false
@@ -199,7 +205,15 @@ object AudioCaptureManager {
                         throw err
                     }
 
-                    if (nextCheckSec > maxTotalSeconds || SystemClock.elapsedRealtime() > deadlineMs) {
+                    val nowLoopMs = SystemClock.elapsedRealtime()
+                    if (silenceTimeoutSeconds != null &&
+                        !hadAudioActivity.get() &&
+                        (nowLoopMs - startedAtMs) >= (silenceTimeoutSeconds * 1000f).toLong()
+                    ) {
+                        return@coroutineScope ProgressiveOutcome.SILENT
+                    }
+
+                    if (nextCheckSec > maxTotalSeconds || nowLoopMs > deadlineMs) {
                         return@coroutineScope if (hadNonSilent) {
                             ProgressiveOutcome.NO_MATCH
                         } else {
@@ -237,6 +251,7 @@ object AudioCaptureManager {
                         }
 
                         if (snapshot != null && snapshot.rms >= silenceRmsThreshold) {
+                            hadAudioActivity.set(true)
                             hadNonSilent = true
                             if (onTryMatch(snapshot)) {
                                 return@coroutineScope ProgressiveOutcome.MATCHED

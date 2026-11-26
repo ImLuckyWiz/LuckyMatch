@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import uniffi.luckymatch_ffi.FfiException
+import uniffi.luckymatch_ffi.FfiLyricsKind
 import uniffi.luckymatch_ffi.FfiLyricsResult
 import uniffi.luckymatch_ffi.FfiRecognizedTrack
 import uniffi.luckymatch_ffi.FfiSyncSnapshot
@@ -111,6 +112,10 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
     private var autoSyncJob: Job? = null
     private var updateJob: Job? = null
     private var pendingSeekCandidate: Pair<Double, Long>? = null
+    private var awaitingNextSong: Boolean = false
+    private var nextSongPrevPosSec: Double = 0.0
+    private var nextSongSilenceRetry: Boolean = false
+    private var songEndTriggered: Boolean = false
 
     init {
         checkForUpdates(manual = false)
@@ -211,18 +216,77 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
 
     fun toggleAutoSync(enabled: Boolean) {
         _uiState.update { it.copy(autoSync = enabled) }
-        scheduleNextAutoSync(delayMs = AUTO_REVERIFY_MS)
+        if (!enabled) {
+            autoSyncJob?.cancel()
+            autoSyncJob = null
+            awaitingNextSong = false
+            nextSongSilenceRetry = false
+            songEndTriggered = false
+            if (identifyJob?.isActive == true && !identifyIsManual) {
+                identifyJob?.cancel()
+                identifyJob = null
+                _uiState.update {
+                    it.copy(audioLevel = 0f, status = RecognitionStatus.Idle)
+                }
+            }
+        } else {
+            scheduleAutoSyncForCurrentState()
+        }
     }
 
     private fun scheduleNextAutoSync(delayMs: Long) {
         autoSyncJob?.cancel()
-        if (!_uiState.value.autoSync || _uiState.value.track == null) return
+        val state = _uiState.value
+        if (!state.autoSync || state.track == null || state.isPaused) return
         autoSyncJob = viewModelScope.launch {
             delay(delayMs)
-            if (isActive && _uiState.value.autoSync && identifyJob?.isActive != true) {
-                identifyNow(isManual = false)
+            val latest = _uiState.value
+            if (isActive && latest.autoSync && !latest.isPaused && identifyJob?.isActive != true) {
+                if (awaitingNextSong) {
+                    startNextSongIdentify(nextSongPrevPosSec, isSilenceRetry = nextSongSilenceRetry)
+                } else {
+                    identifyNow(isManual = false)
+                }
             }
         }
+    }
+
+    private fun scheduleAutoSyncForCurrentState() {
+        autoSyncJob?.cancel()
+        val state = _uiState.value
+        if (!state.autoSync || state.track == null || state.isPaused) return
+
+        val nowMs = SystemClock.elapsedRealtime()
+        val pos = clock?.positionAt(nowMs, state.manualOffsetSec) ?: state.currentPosSec
+        val trigger = computeSongEndTriggerSec(state.track, state.lyrics)
+
+        if (trigger != null) {
+            val remSec = trigger - pos
+            if (remSec <= 0.0) {
+                if (!songEndTriggered && identifyJob?.isActive != true) {
+                    songEndTriggered = true
+                    startNextSongIdentify(pos, isSilenceRetry = false)
+                }
+                return
+            }
+            if (remSec <= AUTO_REVERIFY_SEC + MID_SONG_REVERIFY_END_MARGIN_SEC) {
+                autoSyncJob = viewModelScope.launch {
+                    delay((remSec * 1000.0).toLong().coerceAtLeast(50L))
+                    val latest = _uiState.value
+                    if (isActive && latest.autoSync && !latest.isPaused && identifyJob?.isActive != true) {
+                        songEndTriggered = true
+                        val latestPos = clock?.positionAt(
+                            SystemClock.elapsedRealtime(),
+                            latest.manualOffsetSec,
+                        ) ?: trigger
+                        startNextSongIdentify(latestPos, isSilenceRetry = false)
+                    }
+                }
+                return
+            }
+        }
+
+        scheduleNextAutoSync(delayMs = AUTO_REVERIFY_MS)
     }
 
     fun nudgeOffset(deltaSec: Double) {
@@ -236,6 +300,7 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
                 syncSnapshot = snap,
             )
         }
+        resetSongEndIfBeforeTrigger()
     }
 
     fun resetOffset() {
@@ -248,6 +313,22 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
                 syncSnapshot = snap,
             )
         }
+        resetSongEndIfBeforeTrigger()
+    }
+
+    private fun resetSongEndIfBeforeTrigger() {
+        val state = _uiState.value
+        val trigger = computeSongEndTriggerSec(state.track, state.lyrics)
+        if (trigger != null) {
+            val pos = clock?.positionAt(SystemClock.elapsedRealtime(), state.manualOffsetSec)
+                ?: state.currentPosSec
+            if (pos < trigger - 2.0) {
+                songEndTriggered = false
+                awaitingNextSong = false
+                nextSongSilenceRetry = false
+            }
+        }
+        scheduleAutoSyncForCurrentState()
     }
 
     fun togglePause() {
@@ -259,14 +340,30 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
         } else {
             c.pause(nowMs)
         }
+        val nextPaused = !currentlyPaused
         val pos = c.positionAt(nowMs, _uiState.value.manualOffsetSec)
         val snap = _uiState.value.lyrics?.document?.let { client.evaluateSync(it, pos, HOLD_GAP_SEC) }
         _uiState.update {
             it.copy(
-                isPaused = !currentlyPaused,
+                isPaused = nextPaused,
                 currentPosSec = pos,
                 syncSnapshot = snap,
             )
+        }
+        if (nextPaused) {
+            autoSyncJob?.cancel()
+            autoSyncJob = null
+            awaitingNextSong = false
+            nextSongSilenceRetry = false
+            if (identifyJob?.isActive == true && !identifyIsManual) {
+                identifyJob?.cancel()
+                identifyJob = null
+                _uiState.update {
+                    it.copy(audioLevel = 0f, status = RecognitionStatus.Idle)
+                }
+            }
+        } else {
+            scheduleAutoSyncForCurrentState()
         }
     }
 
@@ -286,19 +383,29 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
                 syncSnapshot = snap,
             )
         }
+        if (state.autoSync && !songEndTriggered && identifyJob?.isActive != true) {
+            val trigger = computeSongEndTriggerSec(state.track, state.lyrics)
+            if (trigger != null && pos >= trigger) {
+                songEndTriggered = true
+                autoSyncJob?.cancel()
+                startNextSongIdentify(pos, isSilenceRetry = false)
+            }
+        }
     }
 
     fun cancelIdentify() {
         identifyJob?.cancel()
         identifyJob = null
         identifyIsManual = false
+        awaitingNextSong = false
+        nextSongSilenceRetry = false
         _uiState.update {
             it.copy(
                 audioLevel = 0f,
                 status = RecognitionStatus.Idle,
             )
         }
-        scheduleNextAutoSync(AUTO_REVERIFY_MS)
+        scheduleAutoSyncForCurrentState()
     }
 
     fun identifyNow(isManual: Boolean = true) {
@@ -319,6 +426,10 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
             return
         }
 
+        if (isManual) {
+            awaitingNextSong = false
+            nextSongSilenceRetry = false
+        }
         identifyIsManual = isManual
         identifyJob = viewModelScope.launch(Dispatchers.IO) {
             if (isManual) {
@@ -326,6 +437,37 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
             } else {
                 runAutoSyncIdentify(source)
             }
+        }
+    }
+
+    private fun startNextSongIdentify(prevPosSec: Double, isSilenceRetry: Boolean) {
+        if (identifyJob?.isActive == true) {
+            if (!identifyIsManual) {
+                identifyJob?.cancel()
+            } else {
+                return
+            }
+        }
+
+        val source = _uiState.value.source
+        if (source == CaptureSource.INTERNAL_AUDIO && MediaProjectionService.activeProjection == null) {
+            _uiState.update {
+                it.copy(status = RecognitionStatus.Error("Grant internal audio capture permission first"))
+            }
+            return
+        }
+
+        awaitingNextSong = true
+        nextSongPrevPosSec = prevPosSec
+        nextSongSilenceRetry = isSilenceRetry
+        identifyIsManual = false
+        val silenceTimeout = if (isSilenceRetry) {
+            NEXT_SONG_RETRY_SILENCE_TIMEOUT_SEC
+        } else {
+            NEXT_SONG_INITIAL_SILENCE_TIMEOUT_SEC
+        }
+        identifyJob = viewModelScope.launch(Dispatchers.IO) {
+            runNextSongIdentify(source, prevPosSec, silenceTimeout)
         }
     }
 
@@ -475,11 +617,118 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
         handleMatchedTrack(match, captured.captureStartElapsedMs, isManual = false)
     }
 
+    private suspend fun runNextSongIdentify(
+        source: CaptureSource,
+        prevPosSec: Double,
+        silenceTimeoutSec: Float,
+    ) {
+        val startedMs = SystemClock.elapsedRealtime()
+        _uiState.update {
+            it.copy(
+                status = RecognitionStatus.Capturing(source, startedMs, durationSec = null),
+                audioLevel = 0f,
+            )
+        }
+
+        var matchedPair: Pair<FfiRecognizedTrack, Long>? = null
+        val outcome = try {
+            AudioCaptureManager.captureProgressive(
+                source = source,
+                silenceRmsThreshold = SILENCE_RMS_THRESHOLD,
+                silenceTimeoutSeconds = silenceTimeoutSec,
+                onAudioLevel = { level ->
+                    _uiState.update { it.copy(audioLevel = level) }
+                },
+                onTryMatch = { snapshot ->
+                    _uiState.update { it.copy(status = RecognitionStatus.Identifying) }
+                    val match = client.recognizePcmI16(
+                        samples = snapshot.samples,
+                        sampleRate = snapshot.sampleRate.toUInt(),
+                        channels = snapshot.channels.toUShort(),
+                    )
+                    if (match != null) {
+                        val prevTrack = _uiState.value.track
+                        val sameSong = prevTrack != null && isSameTrack(prevTrack, match)
+                        val nowMs = SystemClock.elapsedRealtime()
+                        val measuredPos = match.offsetSec +
+                            (((nowMs - snapshot.captureStartElapsedMs).coerceAtLeast(0L)) / 1000.0) *
+                            (1.0 + match.timeskew) +
+                            _uiState.value.manualOffsetSec
+                        val durationSec = prevTrack?.durationMs?.toDouble()?.takeIf { it > 0.0 }?.div(1000.0)
+                        val accept = !sameSong ||
+                            (prevPosSec > 35.0 && measuredPos < 25.0) ||
+                            (durationSec != null && durationSec - measuredPos > 12.0)
+                        if (accept) {
+                            matchedPair = match to snapshot.captureStartElapsedMs
+                            true
+                        } else {
+                            _uiState.update {
+                                it.copy(status = RecognitionStatus.Capturing(source, startedMs, durationSec = null))
+                            }
+                            false
+                        }
+                    } else {
+                        _uiState.update {
+                            it.copy(status = RecognitionStatus.Capturing(source, startedMs, durationSec = null))
+                        }
+                        false
+                    }
+                },
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: FfiException) {
+            _uiState.update {
+                it.copy(
+                    audioLevel = 0f,
+                    status = RecognitionStatus.Error(e.message ?: "Recognition failed"),
+                )
+            }
+            scheduleNextAutoSync(15_000L)
+            return
+        } catch (t: Throwable) {
+            _uiState.update {
+                it.copy(
+                    audioLevel = 0f,
+                    status = RecognitionStatus.Error(t.message ?: "Recognition failed"),
+                )
+            }
+            scheduleNextAutoSync(15_000L)
+            return
+        }
+
+        when (outcome) {
+            ProgressiveOutcome.MATCHED -> {
+                val (match, anchorMs) = matchedPair ?: return
+                handleMatchedTrack(match, anchorMs, isManual = false, forceResync = true)
+            }
+            ProgressiveOutcome.SILENT -> {
+                nextSongSilenceRetry = true
+                _uiState.update { it.copy(audioLevel = 0f, status = RecognitionStatus.SilentAudio) }
+                scheduleNextAutoSync(NEXT_SONG_SILENT_RETRY_MS)
+            }
+            ProgressiveOutcome.NO_MATCH -> {
+                nextSongSilenceRetry = false
+                _uiState.update { it.copy(audioLevel = 0f, status = RecognitionStatus.NoMatch) }
+                scheduleNextAutoSync(NEXT_SONG_NO_MATCH_RETRY_MS)
+            }
+            ProgressiveOutcome.CANCELLED -> {
+                awaitingNextSong = false
+                nextSongSilenceRetry = false
+                _uiState.update { it.copy(audioLevel = 0f, status = RecognitionStatus.Idle) }
+                scheduleAutoSyncForCurrentState()
+            }
+        }
+    }
+
     private suspend fun handleMatchedTrack(
         match: FfiRecognizedTrack,
         captureStartElapsedMs: Long,
         isManual: Boolean,
+        forceResync: Boolean = false,
     ) {
+        awaitingNextSong = false
+        nextSongSilenceRetry = false
         val prevTrack = _uiState.value.track
         val sameSong = prevTrack != null && isSameTrack(prevTrack, match)
         val nowMs = SystemClock.elapsedRealtime()
@@ -490,17 +739,12 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
             captureAnchorMs = captureStartElapsedMs,
         )
 
-        val nextVerifyMs = computeNextVerifyDelayMs(
-            durationMs = match.durationMs,
-            posSec = newAnchor.positionAt(nowMs, _uiState.value.manualOffsetSec),
-        )
-
         if (sameSong && clock != null) {
             val existing = clock!!
             val predicted = existing.positionAt(nowMs, _uiState.value.manualOffsetSec)
             val measured = newAnchor.positionAt(nowMs, _uiState.value.manualOffsetSec)
             val drift = abs(measured - predicted)
-            if (isManual) {
+            if (isManual || forceResync) {
                 clock = newAnchor
                 pendingSeekCandidate = null
             } else if (drift <= 0.6) {
@@ -528,11 +772,12 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
                     isPaused = false,
                 )
             }
-            scheduleNextAutoSync(nextVerifyMs)
+            resetSongEndIfBeforeTrigger()
             return
         }
 
         pendingSeekCandidate = null
+        songEndTriggered = false
         clock = newAnchor
         val pos = newAnchor.positionAt(nowMs, _uiState.value.manualOffsetSec)
         _uiState.update {
@@ -547,7 +792,7 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
                 currentPosSec = pos,
             )
         }
-        scheduleNextAutoSync(nextVerifyMs)
+        scheduleAutoSyncForCurrentState()
 
         val lyricsResult = runCatching {
             client.fetchLyrics(
@@ -572,13 +817,35 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
                 state
             }
         }
+        resetSongEndIfBeforeTrigger()
     }
 
-    private fun computeNextVerifyDelayMs(durationMs: ULong?, posSec: Double): Long {
-        val dur = durationMs?.toDouble() ?: return AUTO_REVERIFY_MS
-        if (dur <= 0.0) return AUTO_REVERIFY_MS
-        val remainingMs = (((dur / 1000.0) - posSec + 3.0).coerceAtLeast(12.0) * 1000.0).toLong()
-        return remainingMs.coerceAtMost(AUTO_REVERIFY_MS)
+    private fun maxSyncedLyricsEndSec(lyrics: FfiLyricsResult?): Double? {
+        val doc = lyrics?.document ?: return null
+        if (doc.kind == FfiLyricsKind.STATIC || doc.lines.isEmpty()) return null
+        var maxEnd: Double? = null
+        for (line in doc.lines) {
+            val end = line.endTime
+            if (end.isFinite() && end > 0.0) {
+                maxEnd = if (maxEnd == null) end else maxOf(maxEnd, end)
+            }
+        }
+        return maxEnd
+    }
+
+    private fun computeSongEndTriggerSec(
+        track: FfiRecognizedTrack?,
+        lyrics: FfiLyricsResult?,
+    ): Double? {
+        if (track == null) return null
+        val trackDur = track.durationMs?.toDouble()?.takeIf { it > 0.0 }?.div(1000.0)
+        val lyricsEnd = maxSyncedLyricsEndSec(lyrics)
+        return when {
+            trackDur != null && lyricsEnd != null -> maxOf(trackDur, lyricsEnd) + SONG_END_DURATION_BUFFER_SEC
+            trackDur != null -> trackDur + SONG_END_DURATION_BUFFER_SEC
+            lyricsEnd != null -> lyricsEnd + SONG_END_LYRICS_BUFFER_SEC
+            else -> null
+        }
     }
 
     private fun isSameTrack(a: FfiRecognizedTrack, b: FfiRecognizedTrack): Boolean {
@@ -601,5 +868,13 @@ class LuckyMatchViewModel(application: Application) : AndroidViewModel(applicati
         private const val SILENCE_RMS_THRESHOLD = 0.0005f
         private const val HOLD_GAP_SEC = 2.5
         private const val AUTO_REVERIFY_MS = 45_000L
+        private const val AUTO_REVERIFY_SEC = 45.0
+        private const val SONG_END_DURATION_BUFFER_SEC = 1.5
+        private const val SONG_END_LYRICS_BUFFER_SEC = 4.0
+        private const val MID_SONG_REVERIFY_END_MARGIN_SEC = 18.0
+        private const val NEXT_SONG_INITIAL_SILENCE_TIMEOUT_SEC = 25.0f
+        private const val NEXT_SONG_RETRY_SILENCE_TIMEOUT_SEC = 4.5f
+        private const val NEXT_SONG_NO_MATCH_RETRY_MS = 6_000L
+        private const val NEXT_SONG_SILENT_RETRY_MS = 10_000L
     }
 }
